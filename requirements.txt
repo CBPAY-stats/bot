@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-httpx
-flask
-apscheduler
-stellar-sdk
+stellar-sdk==8.2.1
+Flask==3.0.3
+apscheduler==3.10.4
+httpx==0.27.0
