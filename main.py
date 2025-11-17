@@ -150,7 +150,10 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid XDB account address.")
         return
 
+    # garante que apaga qualquer entrada antiga primeiro
+    remove_watch(chat_id, account_id)
     add_watch(chat_id, account_id, min_amount)
+
     await update.message.reply_text(
         f"🔔 Now watching:\n`{account_id}`\n"
         f"I will notify you for payments ≥ *{min_amount} XDB*.",
