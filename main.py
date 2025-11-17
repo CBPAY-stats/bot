@@ -9,117 +9,154 @@ from stellar_sdk import Server
 # ---------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable missing!")
 
 server = Server("https://api.xdbchain.com")
 
-WATCHLIST = {}  # addr → (threshold, asset_code, issuer)
+# WATCHLIST structure:
+# address → { "threshold": float, "asset": "XDB" or CODE }
+WATCHLIST = {}
 
 # ---------------------------------------------------------
 # FLASK HEALTH CHECK
 # ---------------------------------------------------------
-app_flask = Flask(__name__)
 
-@app_flask.route("/")
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
 def health():
-    return "Bot is running!", 200
+    return "Bot is running OK!", 200
 
-def start_health_server():
-    app_flask.run(host="0.0.0.0", port=10000, debug=False)
+def start_flask():
+    flask_app.run(host="0.0.0.0", port=10000, debug=False)
 
 # ---------------------------------------------------------
 # TELEGRAM COMMANDS
 # ---------------------------------------------------------
+
 async def start(update, context):
     await update.message.reply_text(
-        "✅ XDB Alerts Bot is running.\nUse:\n"
+        "🤖 XDB Alert Bot is ONLINE!\n\n"
+        "Commands:\n"
         "/watch ADDRESS AMOUNT ASSET\n"
-        "/unwatch ADDRESS"
+        "Example:\n"
+        "/watch GDZ... 2000000 XDB\n\n"
+        "/unwatch ADDRESS\n"
+        "/list"
     )
+
+async def list_cmd(update, context):
+    if not WATCHLIST:
+        return await update.message.reply_text("No addresses being monitored.")
+
+    msg = "📡 Currently watching:\n\n"
+    for addr, data in WATCHLIST.items():
+        msg += f"{addr}\n • Threshold: {data['threshold']}\n • Asset: {data['asset']}\n\n"
+
+    await update.message.reply_text(msg)
 
 async def watch(update, context):
     if len(context.args) < 3:
-        return await update.message.reply_text("Usage: /watch ADDRESS AMOUNT ASSET")
+        return await update.message.reply_text("Usage:\n/watch ADDRESS AMOUNT ASSET")
 
-    addr = context.args[0].upper()
+    address = context.args[0].upper()
     amount = float(context.args[1])
     asset = context.args[2].upper()
 
-    WATCHLIST[addr] = (amount, asset)
-    await update.message.reply_text(f"✓ Watching {addr} for {amount}+ {asset}")
+    WATCHLIST[address] = {
+        "threshold": amount,
+        "asset": asset
+    }
+
+    await update.message.reply_text(
+        f"✅ Now watching:\n{address}\nThreshold: {amount} {asset}"
+    )
 
 async def unwatch(update, context):
     if not context.args:
-        return await update.message.reply_text("Usage: /unwatch ADDRESS")
+        return await update.message.reply_text("Usage:\n/unwatch ADDRESS")
 
     addr = context.args[0].upper()
     WATCHLIST.pop(addr, None)
 
-    await update.message.reply_text(f"✓ Removed {addr} from watchlist")
+    await update.message.reply_text(f"❎ Removed {addr} from watchlist.")
 
 # ---------------------------------------------------------
-# WATCHER JOB
+# PAYMENT CHECKER
 # ---------------------------------------------------------
+
 async def check_payments():
-    for addr, (threshold, asset) in WATCHLIST.items():
+    for address, data in WATCHLIST.items():
+        threshold = data["threshold"]
+        asset = data["asset"]
 
-        payments = (
-            server.payments()
-            .for_account(addr)
-            .order(desc=True)
-            .limit(5)
-            .call()
-            ["records"]
-        )
+        try:
+            payments = (
+                server.payments()
+                .for_account(address)
+                .order(desc=True)
+                .limit(5)
+                .call()["records"]
+            )
+        except Exception as e:
+            print("ERROR calling Horizon:", e)
+            continue
 
         for p in payments:
-            # XDB native
-            if asset == "XDB" and p["type"] == "payment" and p["asset_type"] == "native":
-                amount = float(p["amount"])
-                if amount >= threshold:
-                    print("ALERT XDB:", amount)
 
-            # Tokens (assets)
+            # Native XDB
+            if asset == "XDB" and p["type"] == "payment" and p.get("asset_type") == "native":
+                amt = float(p["amount"])
+                if amt >= threshold:
+                    print("ALERT XDB:", amt)
+
+            # Tokens
             if (
                 asset != "XDB"
                 and p["type"] == "payment"
-                and p["asset_code"].upper() == asset
+                and p.get("asset_code", "").upper() == asset
             ):
-                amount = float(p["amount"])
-                if amount >= threshold:
-                    print("ALERT TOKEN:", amount)
+                amt = float(p["amount"])
+                if amt >= threshold:
+                    print("ALERT TOKEN:", amt)
 
 # ---------------------------------------------------------
-# MAIN APP
+# TELEGRAM BOT RUNNER
 # ---------------------------------------------------------
+
 async def run_bot():
-    tg = (
+    app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    tg.add_handler(CommandHandler("start", start))
-    tg.add_handler(CommandHandler("watch", watch))
-    tg.add_handler(CommandHandler("unwatch", unwatch))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("watch", watch))
+    app.add_handler(CommandHandler("unwatch", unwatch))
 
+    # JOB SCHEDULER
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_payments, "interval", seconds=4)
     scheduler.start()
 
-    print("🔵 Telegram Bot starting polling...")
-    await tg.run_polling(close_loop=False)
+    print("🤖 Telegram polling started...")
+    await app.run_polling()
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
 
 def main():
-    # Start health server in thread
-    threading.Thread(target=start_health_server, daemon=True).start()
+    # Start FLASK in separate thread
+    threading.Thread(target=start_flask, daemon=True).start()
 
-    # Run bot in existing event loop
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_bot())
-    loop.run_forever()
+    # Start telegram bot
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
     main()
