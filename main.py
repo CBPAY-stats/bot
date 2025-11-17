@@ -1,265 +1,219 @@
+import os
+import json
 import asyncio
 import logging
 import sqlite3
-import http.server
-import socketserver
+import threading
 from datetime import datetime
+
+from flask import Flask
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes
 )
-import httpx
+from stellar_sdk import Server
 
+
+# ------------------------------------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # ------------------------------------------------------------------------------------
 # DATABASE
 # ------------------------------------------------------------------------------------
-DB = "xdb_alerts.db"
+DB_FILE = "xdb_alerts.db"
+
 
 def init_db():
-    con = sqlite3.connect(DB)
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS watches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
             chat_id INTEGER,
             account TEXT,
             asset_code TEXT,
             asset_issuer TEXT,
-            min_amount REAL,
-            last_tx TEXT
+            min_amount REAL
         )
     """)
-    con.commit()
-    con.close()
 
-def db_execute(query, params=(), fetch=False):
-    con = sqlite3.connect(DB)
-    cur = con.cursor()
-    cur.execute(query, params)
-    con.commit()
-    rows = cur.fetchall() if fetch else None
-    con.close()
-    return rows
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS seen_txs (
+            tx_id TEXT PRIMARY KEY
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
 
 # ------------------------------------------------------------------------------------
-# SUPPORTED ASSETS
+# ASSET LIST – XDB CHAIN (CURATED)
 # ------------------------------------------------------------------------------------
-ASSETS = {
-    "XDB": {
-        "code": "XDB",
-        "issuer": None,  # native
-    },
-    "CBPAY": {
-        "code": "CBPAY",
-        "issuer": "GD7PT6VAXH227WBYR5KN3OYKGSNXVETMYZUP3R62DFX3BBC7GGOBDFJ2",
-    },
-    "BEEFI": {
-        "code": "BEEFI",
-        "issuer": "GA6E22J3MFL5WZELZ64XQFI42CPJ6V7NMSGXAQKUJC4274GTSRRGUUXZ",
-    },
-    "HONEY": {
-        "code": "HONEY",
-        "issuer": "GAZ5BEQZI67UEJAUEFT7IQHU7A4FXWJDULHLMICLHQ5RF3KLWIRMFZQP",
-    }
+XDB_ASSETS = {
+    "XDB": {"code": "XDB", "issuer": None},
+    "CBPAY": {"code": "CBPAY", "issuer": "GD7PT6VAXH227WBYR5KN3OYKGSNXVETMYZUP3R62DFX3BBC7GGOBDFJ2"},
+    "BEEFI": {"code": "BEEFI", "issuer": "GA6E22J3MFL5WZELZ64XQFI42CPJ6V7NMSGXAQKUJC4274GTSRRGUUXZ"},
+    "HONEY": {"code": "HONEY", "issuer": "GAZ5BEQZI67UEJAUEFT7IQHU7A4FXWJDULHLMICLHQ5RF3KLWIRMFZQP"},
 }
 
 # ------------------------------------------------------------------------------------
-# HORIZON API
+# HEALTH SERVER
 # ------------------------------------------------------------------------------------
-HORIZON = "https://api.xdbchain.com"
+app = Flask(__name__)
 
-async def fetch_payments(account, asset_code, asset_issuer):
-    """Fetch payments filtered by asset."""
-    url = f"{HORIZON}/accounts/{account}/payments?order=desc&limit=20"
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, timeout=10)
-        if r.status_code != 200:
-            return []
+@app.get("/")
+def root():
+    return "Bot is running!", 200
 
-        data = r.json().get("_embedded", {}).get("records", [])
 
-    results = []
-    for p in data:
-        if p.get("type") != "payment":
-            continue
+def start_health_server():
+    app.run(host="0.0.0.0", port=10000)
 
-        # native XDB
-        if asset_code == "XDB":
-            if p.get("asset_type") != "native":
-                continue
-        else:
-            # alphanum asset
-            if p.get("asset_code") != asset_code:
-                continue
-            if p.get("asset_issuer") != asset_issuer:
-                continue
-
-        results.append(p)
-
-    return results
 
 # ------------------------------------------------------------------------------------
-# TELEGRAM BOT
+# TELEGRAM COMMANDS
 # ------------------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Welcome to the XDB Chain Alerts Bot!\n\n"
-        "Use /watch to monitor an account.\n"
+        "👋 Welcome! I monitor XDB Chain payments.\n\n"
+        "Use /watch to track payments:\n\n"
+        "Format:\n"
+        "`/watch ACCOUNT MIN_AMOUNT`\n\n"
         "Example:\n"
-        "`/watch GDZ...ABC 2000000`\n\n"
-        "I will then ask which asset you want to monitor.",
+        "`/watch GDZYYA...WFV6 2000000`\n\n"
+        "Then choose the asset you want to monitor.",
         parse_mode="Markdown"
     )
 
+
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: user sends /watch ACCOUNT MIN_AMOUNT"""
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage:\n/watch ACCOUNT MIN_AMOUNT")
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Usage:\n`/watch ACCOUNT MIN_AMOUNT`",
+            parse_mode="Markdown"
+        )
         return
 
     account = context.args[0]
     min_amount = float(context.args[1])
 
-    # store temporary values in user_data
-    context.user_data["pending_watch"] = {
-        "account": account,
-        "min_amount": min_amount
-    }
+    context.user_data["watch_account"] = account
+    context.user_data["watch_amount"] = min_amount
 
-    # send asset selection buttons
+    # ASSET SELECTION MENU
     keyboard = [
-        [
-            InlineKeyboardButton("XDB", callback_data="asset_XDB"),
-            InlineKeyboardButton("CBPAY", callback_data="asset_CBPAY"),
-        ],
-        [
-            InlineKeyboardButton("BEEFI", callback_data="asset_BEEFI"),
-            InlineKeyboardButton("HONEY", callback_data="asset_HONEY"),
-        ]
+        [InlineKeyboardButton(asset, callback_data=f"asset:{asset}")]
+        for asset in XDB_ASSETS.keys()
     ]
+
     await update.message.reply_text(
-        "Choose the asset you want to monitor:",
+        "Select the asset you want to monitor:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+
 async def asset_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: user clicks an asset button."""
     query = update.callback_query
     await query.answer()
 
-    asset_key = query.data.split("_")[1]  # e.g., asset_XDB → XDB
-    info = context.user_data.get("pending_watch")
+    selected = query.data.split(":")[1]
 
-    if not info:
-        await query.edit_message_text("Session expired. Please use /watch again.")
-        return
+    account = context.user_data["watch_account"]
+    min_amount = context.user_data["watch_amount"]
 
-    account = info["account"]
-    min_amount = info["min_amount"]
-    asset_code = ASSETS[asset_key]["code"]
-    issuer = ASSETS[asset_key]["issuer"]
+    asset_info = XDB_ASSETS[selected]
 
-    # Insert into DB
-    db_execute("""
-        INSERT INTO watches (chat_id, account, asset_code, asset_issuer, min_amount, last_tx)
-        VALUES (?, ?, ?, ?, ?, NULL)
-    """, (query.message.chat_id, account, asset_code, issuer, min_amount))
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("""
+        INSERT INTO alerts (chat_id, account, asset_code, asset_issuer, min_amount)
+        VALUES (?, ?, ?, ?, ?)
+    """, (query.message.chat.id, account, asset_info["code"], asset_info["issuer"], min_amount))
+
+    conn.commit()
+    conn.close()
 
     await query.edit_message_text(
-        f"🔔 Monitoring enabled!\n\n"
-        f"**Account:** `{account}`\n"
-        f"**Asset:** `{asset_code}`\n"
-        f"**Minimum Amount:** `{min_amount}`\n\n"
-        f"I will notify you when a new payment meets the criteria.",
+        f"✅ Alert created!\n\n"
+        f"Account: `{account}`\n"
+        f"Asset: **{selected}**\n"
+        f"Minimum Amount: `{min_amount}` XDB",
         parse_mode="Markdown"
     )
 
-    del context.user_data["pending_watch"]
 
 # ------------------------------------------------------------------------------------
-# MONITORING JOB
+# BLOCKCHAIN MONITOR
 # ------------------------------------------------------------------------------------
+server = Server("https://api.mainnet-v2.xdbchain.com")
+
+
 async def watcher_job():
-    rows = db_execute("SELECT id, chat_id, account, asset_code, asset_issuer, min_amount, last_tx FROM watches", fetch=True)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
 
-    for wid, chat_id, account, asset_code, issuer, min_amount, last_tx in rows:
-        try:
-            payments = await fetch_payments(account, asset_code, issuer)
-        except:
-            continue
+    alerts = c.execute("SELECT chat_id, account, asset_code, asset_issuer, min_amount FROM alerts").fetchall()
 
-        if not payments:
-            continue
+    for chat_id, account, asset_code, asset_issuer, min_amount in alerts:
+        txs = server.payments().for_account(account).limit(20).order(desc=True).call()
 
-        latest = payments[0]
-        txid = latest.get("transaction_hash")
+        for tx in txs["_embedded"]["records"]:
+            txid = tx["id"]
 
-        # skip already processed or old
-        if last_tx == txid:
-            continue
+            # skip if already sent
+            if c.execute("SELECT 1 FROM seen_txs WHERE tx_id = ?", (txid,)).fetchone():
+                continue
 
-        # check amount
-        amount = float(latest.get("amount", 0))
-        if amount < min_amount:
-            continue
+            # check asset match
+            tx_asset = tx.get("asset_code", "XDB")
+            tx_issuer = tx.get("asset_issuer")
 
-        # Save new last_tx
-        db_execute("UPDATE watches SET last_tx=? WHERE id=?", (txid, wid))
+            if tx_asset != asset_code:
+                continue
 
-        # send alert
-        text = (
-            f"💸 *XDB Asset Payment Alert!*\n\n"
-            f"*Asset:* `{asset_code}`\n"
-            f"*Account:* `{account}`\n"
-            f"*Amount:* `{amount}`\n"
-            f"*From:* `{latest.get('from')}`\n"
-            f"*To:* `{latest.get('to')}`\n"
-            f"*Date:* `{latest.get('created_at')}`\n"
-            f"*Transaction:* `{txid}`"
-        )
+            if asset_issuer and tx_issuer != asset_issuer:
+                continue
 
-        try:
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-                )
-        except:
-            pass
+            amount = float(tx["amount"])
+            if amount < min_amount:
+                continue
 
-# ------------------------------------------------------------------------------------
-# HEALTH SERVER
-# ------------------------------------------------------------------------------------
-class HealthHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+            # notify user
+            message = (
+                "💸 *XDB Chain Payment Alert!*\n\n"
+                f"*Account:* `{account}`\n"
+                f"*Asset:* `{asset_code}`\n"
+                f"*Amount:* `{amount}`\n"
+                f"*From:* `{tx['from']}`\n"
+                f"*To:* `{tx['to']}`\n"
+                f"*Date:* `{tx['created_at']}`\n"
+                f"*Tx:* `{txid}`"
+            )
 
-def start_health_server():
-    PORT = 10000
-    server = socketserver.TCPServer(("", PORT), HealthHandler)
-    logger.info(f"Health server on port {PORT}")
-    server.serve_forever()
+            c.execute("INSERT INTO seen_txs (tx_id) VALUES (?)", (txid,))
+            await context_app.bot.send_message(chat_id, message, parse_mode="Markdown")
+
+    conn.commit()
+    conn.close()
+
 
 # ------------------------------------------------------------------------------------
-# MAIN
+# BOT RUNNER (CORRECT)
 # ------------------------------------------------------------------------------------
-import os
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-if not BOT_TOKEN:
-    raise ValueError("ERROR: BOT_TOKEN environment variable not set!")
-
 async def run_bot():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    global context_app
+
+    app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).build()
+    context_app = app
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("watch", watch))
@@ -269,18 +223,17 @@ async def run_bot():
     scheduler.add_job(watcher_job, "interval", seconds=4)
     scheduler.start()
 
-    await app.run_polling()
+    await app.run_polling(drop_pending_updates=True)
+
 
 def main():
     init_db()
-    asyncio.get_event_loop().create_task(run_bot())
 
-    # start health server (separate thread)
-    import threading
+    # start health server
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    asyncio.get_event_loop().run_forever()
+    asyncio.run(run_bot())
+
 
 if __name__ == "__main__":
     main()
-
