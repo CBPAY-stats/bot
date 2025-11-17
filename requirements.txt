@@ -1,4 +1,5 @@
-python-telegram-bot[job-queue]==20.7
-stellar-sdk==13.1.0
-aiosqlite
-aiohttp
+python-telegram-bot==20.7
+httpx
+flask
+apscheduler
+stellar-sdk
