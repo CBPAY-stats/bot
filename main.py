@@ -1,327 +1,280 @@
+import asyncio
 import logging
-import os
 import sqlite3
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import List, Tuple
-
-from stellar_sdk import Server as XDBServer
-from telegram import Update
+import http.server
+import socketserver
+from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes
 )
+import httpx
 
-# ================== CONFIG ==================
-
-HORIZON_URL = "https://horizon.livenet.xdbchain.com"
-NETWORK_PASSPHRASE = "LiveNet Global XDBChain Network ; November 2023"
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DB_PATH = "xdb_alert_bot.db"
-
-xdb_server = XDBServer(HORIZON_URL)
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# ================== DB HELPERS (sqlite3 síncrono) ==================
-
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS watches (
-    chat_id     INTEGER NOT NULL,
-    account_id  TEXT NOT NULL,
-    min_amount  REAL NOT NULL,
-    cursor      TEXT,
-    PRIMARY KEY (chat_id, account_id)
-);
-"""
-
+# ------------------------------------------------------------------------------------
+# DATABASE
+# ------------------------------------------------------------------------------------
+DB = "xdb_alerts.db"
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(CREATE_TABLE_SQL)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def add_watch(chat_id: int, account_id: str, min_amount: float):
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO watches (chat_id, account_id, min_amount, cursor)
-            VALUES (?, ?, ?, 'init')
-            """,
-            (chat_id, account_id, min_amount),
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS watches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            account TEXT,
+            asset_code TEXT,
+            asset_issuer TEXT,
+            min_amount REAL,
+            last_tx TEXT
         )
-        conn.commit()
-    finally:
-        conn.close()
+    """)
+    con.commit()
+    con.close()
 
+def db_execute(query, params=(), fetch=False):
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute(query, params)
+    con.commit()
+    rows = cur.fetchall() if fetch else None
+    con.close()
+    return rows
 
-def remove_watch(chat_id: int, account_id: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        cur = conn.execute(
-            "DELETE FROM watches WHERE chat_id = ? AND account_id = ?",
-            (chat_id, account_id),
-        )
-        conn.commit()
-        return cur.rowcount
-    finally:
-        conn.close()
+# ------------------------------------------------------------------------------------
+# SUPPORTED ASSETS
+# ------------------------------------------------------------------------------------
+ASSETS = {
+    "XDB": {
+        "code": "XDB",
+        "issuer": None,  # native
+    },
+    "CBPAY": {
+        "code": "CBPAY",
+        "issuer": "GD7PT6VAXH227WBYR5KN3OYKGSNXVETMYZUP3R62DFX3BBC7GGOBDFJ2",
+    },
+    "BEEFI": {
+        "code": "BEEFI",
+        "issuer": "GA6E22J3MFL5WZELZ64XQFI42CPJ6V7NMSGXAQKUJC4274GTSRRGUUXZ",
+    },
+    "HONEY": {
+        "code": "HONEY",
+        "issuer": "GAZ5BEQZI67UEJAUEFT7IQHU7A4FXWJDULHLMICLHQ5RF3KLWIRMFZQP",
+    }
+}
 
+# ------------------------------------------------------------------------------------
+# HORIZON API
+# ------------------------------------------------------------------------------------
+HORIZON = "https://api.xdbchain.com"
 
-def list_watches_db(chat_id: int) -> List[Tuple[str, float, str]]:
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        cur = conn.execute(
-            "SELECT account_id, min_amount, COALESCE(cursor, '') FROM watches WHERE chat_id = ?",
-            (chat_id,),
-        )
-        return cur.fetchall()
-    finally:
-        conn.close()
+async def fetch_payments(account, asset_code, asset_issuer):
+    """Fetch payments filtered by asset."""
+    url = f"{HORIZON}/accounts/{account}/payments?order=desc&limit=20"
 
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, timeout=10)
+        if r.status_code != 200:
+            return []
 
-def get_all_watches() -> List[Tuple[int, str, float, str]]:
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        cur = conn.execute(
-            "SELECT chat_id, account_id, min_amount, COALESCE(cursor, 'init') FROM watches"
-        )
-        return cur.fetchall()
-    finally:
-        conn.close()
+        data = r.json().get("_embedded", {}).get("records", [])
 
+    results = []
+    for p in data:
+        if p.get("type") != "payment":
+            continue
 
-def update_cursor(chat_id: int, account_id: str, cursor: str):
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(
-            "UPDATE watches SET cursor = ? WHERE chat_id = ? AND account_id = ?",
-            (cursor, chat_id, account_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        # native XDB
+        if asset_code == "XDB":
+            if p.get("asset_type") != "native":
+                continue
+        else:
+            # alphanum asset
+            if p.get("asset_code") != asset_code:
+                continue
+            if p.get("asset_issuer") != asset_issuer:
+                continue
 
+        results.append(p)
 
-# ================== TELEGRAM HANDLERS ==================
+    return results
 
+# ------------------------------------------------------------------------------------
+# TELEGRAM BOT
+# ------------------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 *Welcome to the XDB Alert Bot!*\n\n"
-        "I monitor XDB blockchain accounts and alert you when payments above your threshold occur.\n\n"
-        "*Available commands:*\n"
-        "`/watch <ACCOUNT_ID> <MIN_AMOUNT>` – Start tracking an account (XDB native payments)\n"
-        "`/unwatch <ACCOUNT_ID>` – Stop tracking an account\n"
-        "`/list` – Show your tracked accounts\n"
-        "\nExample:\n`/watch GDZ... 500000`\n"
-    )
-    await update.message.reply_markdown(msg)
-
-
-async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: /watch <ACCOUNT_ID> <MIN_AMOUNT>\nExample: /watch GDZ... 1000000"
-        )
-        return
-
-    account_id = context.args[0].strip()
-    try:
-        min_amount = float(context.args[1])
-    except ValueError:
-        await update.message.reply_text("MIN_AMOUNT must be a number (example: 1000000).")
-        return
-
-    if not (account_id.startswith("G") and len(account_id) >= 20):
-        await update.message.reply_text("Invalid XDB account address.")
-        return
-
-    # garante que apaga qualquer entrada antiga primeiro
-    remove_watch(chat_id, account_id)
-    add_watch(chat_id, account_id, min_amount)
-
     await update.message.reply_text(
-        f"🔔 Now watching:\n`{account_id}`\n"
-        f"I will notify you for payments ≥ *{min_amount} XDB*.",
+        "Welcome to the XDB Chain Alerts Bot!\n\n"
+        "Use /watch to monitor an account.\n"
+        "Example:\n"
+        "`/watch GDZ...ABC 2000000`\n\n"
+        "I will then ask which asset you want to monitor.",
         parse_mode="Markdown"
     )
 
-
-async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /unwatch <ACCOUNT_ID>")
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: user sends /watch ACCOUNT MIN_AMOUNT"""
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage:\n/watch ACCOUNT MIN_AMOUNT")
         return
 
-    account_id = context.args[0].strip()
-    removed = remove_watch(chat_id, account_id)
+    account = context.args[0]
+    min_amount = float(context.args[1])
 
-    if removed:
-        await update.message.reply_text(f"❎ Stopped watching:\n`{account_id}`", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("This account was not being watched.")
+    # store temporary values in user_data
+    context.user_data["pending_watch"] = {
+        "account": account,
+        "min_amount": min_amount
+    }
 
+    # send asset selection buttons
+    keyboard = [
+        [
+            InlineKeyboardButton("XDB", callback_data="asset_XDB"),
+            InlineKeyboardButton("CBPAY", callback_data="asset_CBPAY"),
+        ],
+        [
+            InlineKeyboardButton("BEEFI", callback_data="asset_BEEFI"),
+            InlineKeyboardButton("HONEY", callback_data="asset_HONEY"),
+        ]
+    ]
+    await update.message.reply_text(
+        "Choose the asset you want to monitor:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    rows = list_watches_db(chat_id)
+async def asset_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: user clicks an asset button."""
+    query = update.callback_query
+    await query.answer()
 
-    if not rows:
-        await update.message.reply_text("You are not watching any accounts yet.")
+    asset_key = query.data.split("_")[1]  # e.g., asset_XDB → XDB
+    info = context.user_data.get("pending_watch")
+
+    if not info:
+        await query.edit_message_text("Session expired. Please use /watch again.")
         return
 
-    lines = ["📋 *Tracked accounts:*"]
-    for account_id, min_amt, cursor in rows:
-        lines.append(f"- `{account_id}` (min: {min_amt} XDB)")
-    await update.message.reply_markdown("\n".join(lines))
+    account = info["account"]
+    min_amount = info["min_amount"]
+    asset_code = ASSETS[asset_key]["code"]
+    issuer = ASSETS[asset_key]["issuer"]
 
+    # Insert into DB
+    db_execute("""
+        INSERT INTO watches (chat_id, account, asset_code, asset_issuer, min_amount, last_tx)
+        VALUES (?, ?, ?, ?, ?, NULL)
+    """, (query.message.chat_id, account, asset_code, issuer, min_amount))
 
-# ================== WATCHER JOB (usa JobQueue) ==================
+    await query.edit_message_text(
+        f"🔔 Monitoring enabled!\n\n"
+        f"**Account:** `{account}`\n"
+        f"**Asset:** `{asset_code}`\n"
+        f"**Minimum Amount:** `{min_amount}`\n\n"
+        f"I will notify you when a new payment meets the criteria.",
+        parse_mode="Markdown"
+    )
 
-async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
-    """Runs every few seconds via JobQueue, checks Horizon and sends alerts."""
-    try:
-        watches = get_all_watches()
-        if not watches:
-            return
+    del context.user_data["pending_watch"]
 
-        for chat_id, account_id, min_amount, cursor in watches:
-            # Se cursor ainda está em estado inicial, faz só sync e não alerta
-            if cursor in (None, "", "init", "now"):
-                payments = (
-                    xdb_server.payments()
-                    .for_account(account_id)
-                    .order("asc")
-                    .limit(50)
-                    .call()
+# ------------------------------------------------------------------------------------
+# MONITORING JOB
+# ------------------------------------------------------------------------------------
+async def watcher_job():
+    rows = db_execute("SELECT id, chat_id, account, asset_code, asset_issuer, min_amount, last_tx FROM watches", fetch=True)
+
+    for wid, chat_id, account, asset_code, issuer, min_amount, last_tx in rows:
+        try:
+            payments = await fetch_payments(account, asset_code, issuer)
+        except:
+            continue
+
+        if not payments:
+            continue
+
+        latest = payments[0]
+        txid = latest.get("transaction_hash")
+
+        # skip already processed or old
+        if last_tx == txid:
+            continue
+
+        # check amount
+        amount = float(latest.get("amount", 0))
+        if amount < min_amount:
+            continue
+
+        # Save new last_tx
+        db_execute("UPDATE watches SET last_tx=? WHERE id=?", (txid, wid))
+
+        # send alert
+        text = (
+            f"💸 *XDB Asset Payment Alert!*\n\n"
+            f"*Asset:* `{asset_code}`\n"
+            f"*Account:* `{account}`\n"
+            f"*Amount:* `{amount}`\n"
+            f"*From:* `{latest.get('from')}`\n"
+            f"*To:* `{latest.get('to')}`\n"
+            f"*Date:* `{latest.get('created_at')}`\n"
+            f"*Transaction:* `{txid}`"
+        )
+
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
                 )
-                records = payments.get("_embedded", {}).get("records", [])
-                if not records:
-                    continue
+        except:
+            pass
 
-                last_token = records[-1].get("paging_token")
-                if last_token:
-                    update_cursor(chat_id, account_id, last_token)
-                # Não enviar alertas nesta primeira sync
-                continue
-
-            # A partir daqui, já temos cursor real → só novos movimentos
-            payments = (
-                xdb_server.payments()
-                .for_account(account_id)
-                .order("asc")
-                .cursor(cursor)
-                .limit(50)
-                .call()
-            )
-            records = payments.get("_embedded", {}).get("records", [])
-            if not records:
-                continue
-
-            last_token = None
-
-            for p in records:
-                last_token = p.get("paging_token")
-
-                if p.get("type") != "payment":
-                    continue
-                if p.get("asset_type") != "native":
-                    continue
-
-                amount = float(p.get("amount", "0"))
-                if amount < min_amount:
-                    continue
-
-                from_addr = p.get("from")
-                to_addr = p.get("to")
-                tx_hash = p.get("transaction_hash")
-                created_at = p.get("created_at")
-
-                text = (
-                    "💸 *XDB Payment Alert!*\n\n"
-                    f"*Account:* `{account_id}`\n"
-                    f"*Amount:* *{amount} XDB*\n"
-                    f"*From:* `{from_addr}`\n"
-                    f"*To:* `{to_addr}`\n"
-                    f"*Date:* `{created_at}`\n"
-                    f"*Tx:* `{tx_hash}`"
-                )
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="Markdown"
-                )
-
-            if last_token:
-                update_cursor(chat_id, account_id, last_token)
-
-    except Exception as e:
-        logger.exception(f"Error in watcher_job: {e}")
-
-
-# ================== MINI HTTP SERVER (HEALTHCHECK) ==================
-
-class HealthHandler(BaseHTTPRequestHandler):
+# ------------------------------------------------------------------------------------
+# HEALTH SERVER
+# ------------------------------------------------------------------------------------
+class HealthHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
 
-
 def start_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"Health HTTP server listening on port {port}")
+    PORT = 10000
+    server = socketserver.TCPServer(("", PORT), HealthHandler)
+    logger.info(f"Health server on port {PORT}")
     server.serve_forever()
 
+# ------------------------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------------------------
+BOT_TOKEN = "REPLACE_THIS_WITH_YOUR_BOT_TOKEN"
 
-# ================== MAIN ==================
+async def run_bot():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("watch", watch))
+    app.add_handler(CallbackQueryHandler(asset_selected))
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(watcher_job, "interval", seconds=4)
+    scheduler.start()
+
+    await app.run_polling()
 
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Please set TELEGRAM_BOT_TOKEN in your environment.")
-
-    # DB
     init_db()
+    asyncio.get_event_loop().create_task(run_bot())
 
-    # Healthcheck HTTP server numa thread separada
-    t = threading.Thread(target=start_health_server, daemon=True)
-    t.start()
+    # start health server (separate thread)
+    import threading
+    threading.Thread(target=start_health_server, daemon=True).start()
 
-    # Telegram bot
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("watch", watch))
-    application.add_handler(CommandHandler("unwatch", unwatch))
-    application.add_handler(CommandHandler("list", list_cmd))
-
-    # Job que corre o watcher a cada 3 segundos
-    application.job_queue.run_repeating(watcher_job, interval=3, first=5)
-
-    # Este método gere o event loop internamente – nada de asyncio.run aqui
-    application.run_polling()
-
+    asyncio.get_event_loop().run_forever()
 
 if __name__ == "__main__":
     main()
