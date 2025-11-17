@@ -251,7 +251,7 @@ def start_health_server():
 # ------------------------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------------------------
-BOT_TOKEN = "REPLACE_THIS_WITH_YOUR_BOT_TOKEN"
+BOT_TOKEN = "8240598081:AAH7RGt1c2KkTUQ4F5dsEs0OEgtgbQhgIbQ"
 
 async def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
