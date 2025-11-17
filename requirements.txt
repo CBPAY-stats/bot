@@ -1,4 +1,4 @@
 python-telegram-bot==20.7
-stellar-sdk==10.1.0
+stellar-sdk==13.1.0
 aiosqlite
 aiohttp
