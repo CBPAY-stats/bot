@@ -62,7 +62,7 @@ def add_watch(chat_id: int, account_id: str, min_amount: float):
                 ?, ?, ?,
                 COALESCE(
                     (SELECT cursor FROM watches WHERE chat_id = ? AND account_id = ?),
-                    'now'
+                    'init'
                 )
             )
             """,
@@ -102,7 +102,7 @@ def get_all_watches() -> List[Tuple[int, str, float, str]]:
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.execute(
-            "SELECT chat_id, account_id, min_amount, COALESCE(cursor, 'now') FROM watches"
+            "SELECT chat_id, account_id, min_amount, COALESCE(cursor, 'init') FROM watches"
         )
         return cur.fetchall()
     finally:
@@ -204,6 +204,26 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         for chat_id, account_id, min_amount, cursor in watches:
+            # Se cursor ainda está em estado inicial, faz só sync e não alerta
+            if cursor in (None, "", "init", "now"):
+                payments = (
+                    xdb_server.payments()
+                    .for_account(account_id)
+                    .order("asc")
+                    .limit(50)
+                    .call()
+                )
+                records = payments.get("_embedded", {}).get("records", [])
+                if not records:
+                    continue
+
+                last_token = records[-1].get("paging_token")
+                if last_token:
+                    update_cursor(chat_id, account_id, last_token)
+                # Não enviar alertas nesta primeira sync
+                continue
+
+            # A partir daqui, já temos cursor real → só novos movimentos
             payments = (
                 xdb_server.payments()
                 .for_account(account_id)
