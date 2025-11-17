@@ -58,15 +58,9 @@ def add_watch(chat_id: int, account_id: str, min_amount: float):
         conn.execute(
             """
             INSERT OR REPLACE INTO watches (chat_id, account_id, min_amount, cursor)
-            VALUES (
-                ?, ?, ?,
-                COALESCE(
-                    (SELECT cursor FROM watches WHERE chat_id = ? AND account_id = ?),
-                    'init'
-                )
-            )
+            VALUES (?, ?, ?, 'init')
             """,
-            (chat_id, account_id, min_amount, chat_id, account_id),
+            (chat_id, account_id, min_amount),
         )
         conn.commit()
     finally:
