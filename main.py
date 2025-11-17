@@ -251,7 +251,12 @@ def start_health_server():
 # ------------------------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------------------------
-BOT_TOKEN = "8240598081:AAH7RGt1c2KkTUQ4F5dsEs0OEgtgbQhgIbQ"
+import os
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise ValueError("ERROR: BOT_TOKEN environment variable not set!")
 
 async def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
