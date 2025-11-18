@@ -36,7 +36,7 @@ STELLAR_HORIZON_URL = "https://horizon.livenet.xdbchain.com"
 # }
 WATCHLIST: Dict[str, Dict[str, Any]] = {}
 
-server = Server(STELLAR_HORIZON_URL)
+server = Server(STELLAR_HORIZON_URL )
 
 telegram_app = None
 
@@ -263,17 +263,13 @@ async def list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------
-# CHECK DAS NOVAS TRANSAÇÕES (MODO DEBUG)
+# CHECK DAS NOVAS TRANSAÇÕES - CORRIGIDO
 # ---------------------------------------------------------
 
 async def check_watchlist(context: ContextTypes.DEFAULT_TYPE):
     """
     Job que corre periodicamente e verifica se apareceram NOVAS payments
     com valor ≥ threshold para cada address vigiado.
-
-    Em modo DEBUG:
-    - Diz quantas payments novas recebeu do Horizon
-    - Mostra até 2 registos "raw" para analisarmos a estrutura
     """
     if not WATCHLIST:
         return
@@ -289,34 +285,14 @@ async def check_watchlist(context: ContextTypes.DEFAULT_TYPE):
         # Vai buscar novas payments depois do last_token
         records = await get_new_payments(address, last_token)
 
-        # DEBUG 1: quantas payments novas vieram
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"🔎 DEBUG XDB\n"
-                f"Address: {address}\n"
-                f"Cursor anterior: {last_token}\n"
-                f"Payments novas recebidas do Horizon: {len(records)}"
-            ),
-        )
-
         if not records:
-            # Nada novo, segue para o próximo address
             continue
 
-        # DEBUG 2: mostrar até 2 payments "raw" para vermos a estrutura real
-        for rec in records[:2]:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"🔎 DEBUG payment raw:\n`{rec}`",
-                parse_mode="Markdown",
-            )
-
-        triggered = False
         new_last_token = last_token
 
         for rec in records:
             # Atualizamos sempre o último paging_token percorrido
+            # Isto é CRUCIAL para a paginação funcionar corretamente
             new_last_token = rec.get("paging_token", new_last_token)
 
             if not payment_matches_asset(rec, asset, address):
@@ -329,24 +305,26 @@ async def check_watchlist(context: ContextTypes.DEFAULT_TYPE):
 
             if amt >= threshold:
                 # Encontrámos pelo menos uma nova payment ≥ threshold
-                triggered = True
+                
+                # Alerta é enviado para CADA transação que satisfaça o critério
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "🎉 *ALERTA XDB CHAIN*\n\n"
+                        f"O endereço:\n`{address}`\n\n"
+                        f"recebeu uma transação de *{amt} {asset}* (≥ {threshold} {asset}).\n\n"
+                        f"Hash: `{rec.get('transaction_hash')}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+                
+                # Não fazemos break, para que possa alertar para múltiplas transações
+                # no mesmo ciclo de verificação.
 
         # Atualizamos o cursor para não repetir as mesmas payments
         data["last_paging_token"] = new_last_token
 
-        if triggered:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "🎉 *ALERTA XDB CHAIN*\n\n"
-                    f"O endereço:\n`{address}`\n\n"
-                    f"recebeu *uma nova transação* com valor ≥ {threshold} {asset}.\n\n"
-                    f"(Estou a vigiar apenas transações novas a partir do momento em que fizeste /watch.)"
-                ),
-                parse_mode="Markdown",
-            )
-            # Depois do alerta, removemos este address da watchlist
-            WATCHLIST.pop(address, None)
+        # REMOVIDO: WATCHLIST.pop(address, None) para que o bot continue a vigiar.
 
 
 # ---------------------------------------------------------
