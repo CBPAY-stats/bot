@@ -1,7 +1,7 @@
 import os
 import threading
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from flask import Flask
 from telegram import Update
@@ -22,16 +22,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable missing!")
 
-# Endpoint oficial da XDB Chain Mainnet (Horizon)
+# Endpoint oficial da XDB Chain Mainnet (Horizon compatível)
 STELLAR_HORIZON_URL = "https://horizon.livenet.xdbchain.com"
 
 # Estrutura em memória:
 # {
 #   address: {
-#       "threshold": float,       # valor mínimo de NOVO montante
-#       "asset": str,            # ex: "XDB"
+#       "threshold": float,          # valor mínimo de UMA NOVA transação
+#       "asset": str,               # ex: "XDB"
 #       "chat_id": int,
-#       "base_balance": float,   # saldo no momento em que /watch foi chamado
+#       "last_paging_token": str | None,  # última payment vista
 #   }
 # }
 WATCHLIST: Dict[str, Dict[str, Any]] = {}
@@ -50,7 +50,7 @@ flask_app = Flask(__name__)
 
 @flask_app.get("/")
 def index():
-    return "✅ XDB Bot is running on XDB Chain!", 200
+    return "✅ XDB Bot (nova transação ≥ X) a correr na XDB Chain!", 200
 
 
 @flask_app.get("/health")
@@ -67,17 +67,18 @@ def start_flask():
 
 
 # ---------------------------------------------------------
-# TELEGRAM HANDLERS
+# HELP / START
 # ---------------------------------------------------------
 
 HELP_TEXT = (
     "👋 Olá! Eu sou o XDB Bot (XDB Chain).\n\n"
+    "Vou avisar quando um endereço receber *uma nova transação* com valor ≥ threshold.\n\n"
     "Comandos disponíveis:\n"
     "/start – mensagem de boas-vindas\n"
     "/help – mostra esta ajuda\n"
-    "/watch ADDRESS AMOUNT ASSET – vigiar NOVO montante\n"
+    "/watch ADDRESS AMOUNT ASSET – vigiar NOVAS transações\n"
     "   • ADDRESS: endereço XDB Chain\n"
-    "   • AMOUNT: valor mínimo de novo montante (ex: 30)\n"
+    "   • AMOUNT: valor mínimo de uma nova transação (ex: 30)\n"
     "   • ASSET: código do asset (ex: XDB)\n"
     "/unwatch ADDRESS – parar vigilância\n"
     "/list – listar vigilâncias\n"
@@ -87,7 +88,8 @@ HELP_TEXT = (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 Bem-vindo ao XDB Bot na XDB Chain!\n\n"
-        "Vou avisar quando um endereço receber NOVO montante acima de um threshold.\n"
+        "Eu aviso-te quando um endereço receber UMA NOVA transação "
+        "com valor igual ou superior ao threshold que definires.\n\n"
         "Usa /help para veres os comandos disponíveis."
     )
 
@@ -96,13 +98,98 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
 
-# -------------------- WATCH / UNWATCH / LIST --------------------
+# ---------------------------------------------------------
+# FUNÇÕES AUXILIARES HORIZON (PAYMENTS)
+# ---------------------------------------------------------
+
+async def get_latest_paging_token(address: str) -> Optional[str]:
+    """
+    Obtém o paging_token da payment mais recente deste address.
+    Se não houver nenhuma payment ou a conta ainda não existir, devolve None.
+    """
+    def _call():
+        return (
+            server.payments()
+            .for_account(address)
+            .order("desc")
+            .limit(1)
+            .call()
+        )
+
+    try:
+        resp = await asyncio.to_thread(_call)
+    except NotFoundError:
+        # Conta não existe / sem dados -> sem payments
+        return None
+    except Exception:
+        # Outro erro qualquer -> tratamos como sem payments
+        return None
+
+    records = resp.get("_embedded", {}).get("records", [])
+    if not records:
+        return None
+
+    return records[0].get("paging_token")
+
+
+async def get_new_payments(address: str, cursor: Optional[str]) -> list[dict]:
+    """
+    Devolve a lista de *novas* payments para o address, a partir de um cursor (paging_token).
+    Se cursor for None, começa a partir do estado atual (vai apanhar tudo no histórico),
+    mas nós só vamos usar cursor=None quando ainda não havia nada.
+    """
+    def _call():
+        req = (
+            server.payments()
+            .for_account(address)
+            .order("asc")
+            .limit(50)
+        )
+        if cursor:
+            req = req.cursor(cursor)
+        return req.call()
+
+    try:
+        resp = await asyncio.to_thread(_call)
+    except NotFoundError:
+        # Conta sem payments / não existe -> nada de novo
+        return []
+    except Exception:
+        # Outro erro -> por segurança devolve vazio
+        return []
+
+    return resp.get("_embedded", {}).get("records", [])
+
+
+def payment_matches_asset(rec: dict, asset_code: str, address: str) -> bool:
+    """
+    Verifica se uma payment:
+    - é *para* este address
+    - é do asset certo (XDB/nativo ou outro)
+    """
+    # Apenas payments onde o address é o destinatário
+    if rec.get("to") != address:
+        return False
+
+    asset_code = asset_code.upper()
+
+    # Asset nativo (XDB)
+    if asset_code in ("XDB", "NATIVE"):
+        return rec.get("asset_type") == "native"
+
+    # Outros assets emitidos
+    return rec.get("asset_code", "").upper() == asset_code
+
+
+# ---------------------------------------------------------
+# WATCH / UNWATCH / LIST
+# ---------------------------------------------------------
 
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /watch ADDRESS AMOUNT ASSET
     Ex: /watch GDZYYA... 30 XDB
-    Significa: alerta quando esse endereço receber >= 30 XDB NOVOS (desde agora).
+    Significa: alerta quando esse address receber *uma nova transação* ≥ 30 XDB.
     """
     if len(context.args) < 3:
         await update.message.reply_text(
@@ -110,7 +197,8 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/watch ADDRESS AMOUNT ASSET\n\n"
             "Exemplo:\n"
             "/watch GDZYYA... 30 XDB\n\n"
-            "Vou comparar o saldo daqui para a frente e avisar quando o NOVO montante atingir o threshold."
+            "Vou escutar novas transações e avisar quando UMA delas tiver "
+            "valor ≥ AMOUNT para esse endereço."
         )
         return
 
@@ -125,21 +213,22 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asset = context.args[2].upper().strip()
     chat_id = update.effective_chat.id
 
-    # Lê o saldo atual para definir o "ponto de partida"
-    current_balance = await fetch_balance(address, asset)
+    # Guardamos o paging_token mais recente agora -> tudo o que vier DEPOIS disto é "novo"
+    last_token = await get_latest_paging_token(address)
 
     WATCHLIST[address] = {
         "threshold": amount,
         "asset": asset,
         "chat_id": chat_id,
-        "base_balance": current_balance,
+        "last_paging_token": last_token,
     }
 
     await update.message.reply_text(
         "✅ Endereço adicionado à watchlist (XDB Chain):\n"
         f"• Address: {address}\n"
-        f"• Threshold de NOVO montante: {amount} {asset}\n"
-        f"• Saldo atual (ponto de partida): {current_balance} {asset}"
+        f"• Threshold (nova transação): {amount} {asset}\n"
+        f"• Cursor inicial: {last_token if last_token else 'nenhuma payment anterior encontrada'}\n\n"
+        "Só vou considerar *novas* transações a partir deste momento."
     )
 
 
@@ -166,53 +255,21 @@ async def list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for addr, data in WATCHLIST.items():
         msg_lines.append(
             f"{addr}\n"
-            f" • Threshold NOVO montante: {data['threshold']} {data['asset']}\n"
-            f" • Saldo base: {data.get('base_balance', 0.0)} {data['asset']}\n"
+            f" • Threshold (nova tx): {data['threshold']} {data['asset']}\n"
+            f" • Último paging_token: {data.get('last_paging_token', 'None')}\n"
         )
 
     await update.message.reply_text("\n".join(msg_lines))
 
 
 # ---------------------------------------------------------
-# BALANCE CHECK NA XDB CHAIN (via Horizon)
+# CHECK DAS NOVAS TRANSAÇÕES
 # ---------------------------------------------------------
-
-async def fetch_balance(address: str, asset_code: str) -> float:
-    """
-    Devolve o saldo do asset_code para o address na XDB Chain.
-    Se a conta não existir (404 / NotFound), devolve 0.0 sem mandar erro para o utilizador.
-    """
-    def _get_account():
-        return server.accounts().account_id(address).call()
-
-    try:
-        account = await asyncio.to_thread(_get_account)
-    except NotFoundError:
-        # Conta ainda não existe / não foi funded -> tratamos como saldo 0
-        return 0.0
-    except Exception:
-        # Qualquer outro erro inesperado -> também tratamos como 0 para não spammar
-        return 0.0
-
-    balances = account.get("balances", [])
-    asset_code = asset_code.upper()
-
-    for b in balances:
-        # Em forks de Stellar normalmente o asset base (XDB) continua a ser "native"
-        if asset_code in ("XDB", "NATIVE"):
-            if b.get("asset_type") == "native":
-                return float(b["balance"])
-
-        if b.get("asset_code", "").upper() == asset_code:
-            return float(b["balance"])
-
-    return 0.0
-
 
 async def check_watchlist(context: ContextTypes.DEFAULT_TYPE):
     """
-    Job que corre periodicamente e verifica se entrou NOVO montante
-    suficiente (>= threshold) desde o saldo base guardado em /watch.
+    Job que corre periodicamente e verifica se apareceram NOVAS payments
+    com valor ≥ threshold para cada address vigiado.
     """
     if not WATCHLIST:
         return
@@ -223,34 +280,53 @@ async def check_watchlist(context: ContextTypes.DEFAULT_TYPE):
         threshold = data["threshold"]
         asset = data["asset"]
         chat_id = data["chat_id"]
-        base_balance = float(data.get("base_balance", 0.0))
+        last_token = data.get("last_paging_token")
 
-        # Saldo atual
-        balance = await fetch_balance(address, asset)
+        # Vai buscar novas payments depois do last_token
+        records = await get_new_payments(address, last_token)
 
-        # Novo montante recebido desde que começámos a vigiar
-        delta = max(0.0, balance - base_balance)
+        if not records:
+            continue
 
-        if delta >= threshold:
+        triggered = False
+        new_last_token = last_token
+
+        for rec in records:
+            # Atualizamos sempre o último paging_token percorrido
+            new_last_token = rec.get("paging_token", new_last_token)
+
+            if not payment_matches_asset(rec, asset, address):
+                continue
+
+            try:
+                amt = float(rec.get("amount", "0"))
+            except ValueError:
+                continue
+
+            if amt >= threshold:
+                # Encontrámos pelo menos uma nova payment ≥ threshold
+                triggered = True
+
+        # Atualizamos o cursor para não repetir as mesmas payments
+        data["last_paging_token"] = new_last_token
+
+        if triggered:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     "🎉 *ALERTA XDB CHAIN*\n\n"
                     f"O endereço:\n`{address}`\n\n"
-                    f"recebeu um NOVO montante de pelo menos {threshold} {asset}.\n\n"
-                    f"*Saldo base:* {base_balance} {asset}\n"
-                    f"*Saldo atual:* {balance} {asset}\n"
-                    f"*Novo montante total:* {delta} {asset}"
+                    f"recebeu *uma nova transação* com valor ≥ {threshold} {asset}.\n\n"
+                    f"(Estou a vigiar apenas transações novas a partir do momento em que fizeste /watch.)"
                 ),
                 parse_mode="Markdown",
             )
-
-            # Remove da watchlist após disparar o alerta
+            # Depois do alerta, removemos este address da watchlist
             WATCHLIST.pop(address, None)
 
 
 # ---------------------------------------------------------
-# TELEGRAM BOOTSTRAP (SEM asyncio.run)
+# TELEGRAM BOOTSTRAP
 # ---------------------------------------------------------
 
 def run_bot():
@@ -276,7 +352,6 @@ def run_bot():
         first=10,      # atraso inicial
     )
 
-    # run_polling gere o event loop por nós (não usar asyncio.run)
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
     )
