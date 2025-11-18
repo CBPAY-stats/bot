@@ -263,13 +263,17 @@ async def list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------
-# CHECK DAS NOVAS TRANSAÇÕES
+# CHECK DAS NOVAS TRANSAÇÕES (MODO DEBUG)
 # ---------------------------------------------------------
 
 async def check_watchlist(context: ContextTypes.DEFAULT_TYPE):
     """
     Job que corre periodicamente e verifica se apareceram NOVAS payments
     com valor ≥ threshold para cada address vigiado.
+
+    Em modo DEBUG:
+    - Diz quantas payments novas recebeu do Horizon
+    - Mostra até 2 registos "raw" para analisarmos a estrutura
     """
     if not WATCHLIST:
         return
@@ -285,8 +289,28 @@ async def check_watchlist(context: ContextTypes.DEFAULT_TYPE):
         # Vai buscar novas payments depois do last_token
         records = await get_new_payments(address, last_token)
 
+        # DEBUG 1: quantas payments novas vieram
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🔎 DEBUG XDB\n"
+                f"Address: {address}\n"
+                f"Cursor anterior: {last_token}\n"
+                f"Payments novas recebidas do Horizon: {len(records)}"
+            ),
+        )
+
         if not records:
+            # Nada novo, segue para o próximo address
             continue
+
+        # DEBUG 2: mostrar até 2 payments "raw" para vermos a estrutura real
+        for rec in records[:2]:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔎 DEBUG payment raw:\n`{rec}`",
+                parse_mode="Markdown",
+            )
 
         triggered = False
         new_last_token = last_token
